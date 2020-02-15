@@ -5,6 +5,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/shadowsocks/go-shadowsocks2/internal"
 	"github.com/shadowsocks/go-shadowsocks2/socks"
 )
 
@@ -73,13 +74,8 @@ func tcpLocal(addr, server string, shadow func(net.Conn) net.Conn, getAddr func(
 			rc.(*net.TCPConn).SetKeepAlive(true)
 			rc = shadow(rc)
 
-			if _, err = rc.Write(tgt); err != nil {
-				logf("failed to send target address: %v", err)
-				return
-			}
-
 			logf("proxy %s <-> %s <-> %s", c.RemoteAddr(), server, tgt)
-			_, _, err = relay(rc, c)
+			_, _, err = helper(rc, c, tgt)
 			if err != nil {
 				if err, ok := err.(net.Error); ok && err.Timeout() {
 					return // ignore i/o timeout
@@ -156,6 +152,30 @@ func relay(left, right net.Conn) (int64, int64, error) {
 	n, err := io.Copy(left, right)
 	right.SetDeadline(time.Now()) // wake up the other goroutine blocking on right
 	left.SetDeadline(time.Now())  // wake up the other goroutine blocking on left
+	rs := <-ch
+
+	if err == nil {
+		err = rs.Err
+	}
+	return n, rs.N, err
+}
+
+func helper(rc, c net.Conn, header []byte) (int64, int64, error) {
+	type res struct {
+		N   int64
+		Err error
+	}
+	ch := make(chan res)
+	go func() {
+		n, err := io.Copy(c, rc)
+		c.SetDeadline(time.Now())  // wake up the other goroutine blocking on right
+		rc.SetDeadline(time.Now()) // wake up the other goroutine blocking on left
+		ch <- res{n, err}
+	}()
+
+	n, err := io.Copy(rc, internal.ReaderWithHeader(c, header))
+	c.SetDeadline(time.Now())  // wake up the other goroutine blocking on right
+	rc.SetDeadline(time.Now()) // wake up the other goroutine blocking on left
 	rs := <-ch
 
 	if err == nil {
